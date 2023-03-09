@@ -37,7 +37,7 @@ transform.sequence failures(propagate) {
   //%conv = transform.structured.match ops{["linalg.conv_2d_nchw_fchw"]} in %variant_op : (!pdl.operation) -> !pdl.operation
   %fill = transform.structured.match ops{["linalg.fill"]} in %variant_op : (!pdl.operation) -> !pdl.operation
   %forall, %tiled_matmul =
-    transform.iree.tile_to_forall_and_workgroup_count_region %matmul tile_sizes [1, 32, 64, 0]
+    transform.iree.tile_to_forall_and_workgroup_count_region %matmul tile_sizes [1, 32, 128, 0]
     ( mapping = [#gpu.block<x>, #gpu.block<y>, #gpu.block<z>] )
   //%forall, %tiled_matmul =
   //  transform.structured.tile_to_forall_op %matmul tile_sizes [1, 32, 32, 0]
@@ -52,38 +52,53 @@ transform.sequence failures(propagate) {
   %im2col_loopk = transform.structured.fuse_into_containing_op %tiled_im2col into %loop
   transform.iree.apply_patterns %variant_op {canonicalization, cse}
 
+  // Step 4. Promote to shared mem
+  // ==============================================================
+  //%promoted_img2col_l2, %alloc_1 = transform.iree.promote_operands %im2col_loopk [0]
+  //  : (!pdl.operation) -> (!pdl.operation, !pdl.operation)
+  %promoted_matmul_l2, %alloc_1 = transform.iree.promote_operands %matmul_loopk [0]
+    : (!pdl.operation) -> (!pdl.operation, !pdl.operation)
+  transform.iree.apply_patterns %variant_op {canonicalization, cse}
+
   // Step 5. Map to threads
   // ==============================================================
   %forall_l3, %matmul_l3 =
-  transform.structured.tile_to_forall_op %matmul_loopk num_threads [0, 16, 16]
+  transform.structured.tile_to_forall_op %promoted_matmul_l2 num_threads [0, 2, 8]
     ( mapping = [#gpu.thread<y>, #gpu.thread<x>] )
-  %im2col_l3 = transform.structured.fuse_into_containing_op %im2col_loopk into %forall_l3
+  transform.structured.tile_to_forall_op %im2col_loopk num_threads [0, 2, 8]
+    ( mapping = [#gpu.thread<y>, #gpu.thread<x>] )
+  //%im2col_l3 = transform.structured.fuse_into_containing_op %promoted_img2col_l2 into %forall_l3
   transform.iree.apply_patterns %variant_op {canonicalization, cse}
 
-  //// Step 6. Vectorize
-  //// ==============================================================
-  //%func_v = transform.structured.match ops{["func.func"]} in %variant_op : (!pdl.operation) -> !pdl.operation
-  //%func_v_2 = transform.iree.apply_patterns %func_v { rank_reducing_linalg, rank_reducing_vector }
-  //%func_v_3 = transform.structured.vectorize %func_v_2 { vectorize_nd_extract }
-  //////%func_v_4 = transform.iree.apply_patterns %func_v_3 { unroll_vectors_gpu_wmma }
-  //transform.iree.apply_patterns %variant_op {canonicalization, cse}
+  // Step 6. Vectorize
+  // ==============================================================
+  %func_v = transform.structured.match ops{["func.func"]} in %variant_op : (!pdl.operation) -> !pdl.operation
+  %func_v_2 = transform.iree.apply_patterns %func_v { rank_reducing_linalg, rank_reducing_vector }
+  %func_v_3 = transform.structured.vectorize %func_v_2 { vectorize_nd_extract }
+  %func_v_4 = transform.iree.apply_patterns %func_v_3 { unroll_vectors_gpu_wmma }
+  transform.iree.apply_patterns %variant_op {canonicalization, cse}
 
-  //// Step 7. Bufferize and drop HAL decriptor from memref ops.
-  //// ===========================================================================
-  //%func_4 = transform.iree.apply_patterns %func_v_3 { fold_reassociative_reshapes }
-  //%variant_op_2 = transform.iree.eliminate_empty_tensors %variant_op
-  //%func_5 = transform.structured.match ops{["func.func"]} in %variant_op_2 : (!pdl.operation) -> !pdl.operation
-  //%func_6 = transform.iree.apply_patterns %func_5 { erase_unnecessary_tensor_operands }
-  //%variant_op_3 = transform.iree.bufferize { target_gpu } %variant_op_2
-  //%memref_func = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
-  //transform.iree.erase_hal_descriptor_type_from_memref %memref_func
-  //transform.iree.apply_patterns %variant_op_3 {canonicalization, cse}
+  // Step 7. Bufferize and drop HAL decriptor from memref ops.
+  // ===========================================================================
+  %func_4 = transform.iree.apply_patterns %func_v_4 { fold_reassociative_reshapes }
+  %variant_op_2 = transform.iree.eliminate_empty_tensors %variant_op
+  %func_5 = transform.structured.match ops{["func.func"]} in %variant_op_2 : (!pdl.operation) -> !pdl.operation
+  %func_6 = transform.iree.apply_patterns %func_5 { erase_unnecessary_tensor_operands }
+  %variant_op_3 = transform.iree.bufferize { target_gpu } %variant_op_2
+  transform.iree.apply_patterns %variant_op_3 {canonicalization, cse}
 
-  //// Step 6. Post-bufferization mapping to blocks and threads.
-  //// ===========================================================================
-  //%func_7 = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
-  //%func_8 = transform.iree.forall_to_workgroup %func_7
-  //%func_9 = transform.iree.map_nested_forall_to_gpu_threads %func_8
-  //    { workgroup_size = [16, 16, 1] }
-  //transform.iree.apply_patterns %variant_op_3 {canonicalization, cse}
+  // Step 6. Post-bufferization mapping to blocks and threads.
+  // ===========================================================================
+  %func_7 = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
+  %func_8 = transform.iree.forall_to_workgroup %func_7
+  %func_9 = transform.iree.map_nested_forall_to_gpu_threads %func_8
+      { workgroup_size = [8, 2, 1] }
+  transform.iree.apply_patterns %variant_op_3 {canonicalization, cse}
+  %memref_func = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
+  %func_10 = transform.iree.gpu_distribute_shared_memory_copy %memref_func
+    : (!pdl.operation) -> !pdl.operation
+  %func_11 = transform.iree.erase_hal_descriptor_type_from_memref %func_10
+  transform.iree.apply_patterns %variant_op_3 {canonicalization, cse, licm, tiling_canonicalization}
+  %func_12 = transform.iree.vector.vector_to_mma_conversion %func_11 { use_wmma }
+  transform.iree.apply_patterns %variant_op_3 {canonicalization, cse, licm, tiling_canonicalization}
 }
