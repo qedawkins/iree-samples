@@ -140,7 +140,7 @@ transform.sequence failures(propagate) {
   // better off with pipelining only.
   // ==============================================================================
   %matmul_padded_l2 = transform.structured.pad %matmul_l2 {
-    padding_values = [0.0 : f32, 0.0 : f32, 0.0 : f32], 
+    padding_values = [0.0 : f16, 0.0 : f16, 0.0 : f16], 
     padding_dimensions = [0, 1, 2], 
     pack_paddings=[1, 1, 1]
   }

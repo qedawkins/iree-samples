@@ -25,7 +25,7 @@ transform.sequence failures(propagate) {
 ^bb1(%variant_op: !pdl.operation):
   // Step 2. Apply im2col patterns
   // ==============================================================
-  %conv = transform.structured.match ops{["linalg.conv_2d_nchw_fchw"]} in %variant_op : (!pdl.operation) -> !pdl.operation
+  %conv = transform.structured.match ops{["linalg.conv_2d_nhwc_hwcf"]} in %variant_op : (!pdl.operation) -> !pdl.operation
   //%im2col, %expand = transform.structured.convert_conv2d_to_img2col %conv : (!pdl.operation) -> (!pdl.operation, !pdl.operation)
   %im2col, %expand = transform.iree.convert_conv2d_to_img2col_and_adjust_workgroup_count_region %conv : (!pdl.operation) -> (!pdl.operation, !pdl.operation)
   %matmul = transform.get_producer_of_operand %expand[0]
@@ -37,7 +37,7 @@ transform.sequence failures(propagate) {
   //%conv = transform.structured.match ops{["linalg.conv_2d_nchw_fchw"]} in %variant_op : (!pdl.operation) -> !pdl.operation
   %fill = transform.structured.match ops{["linalg.fill"]} in %variant_op : (!pdl.operation) -> !pdl.operation
   %forall, %tiled_matmul =
-    transform.iree.tile_to_forall_and_workgroup_count_region %matmul tile_sizes [1, 16, 64, 0]
+    transform.iree.tile_to_forall_and_workgroup_count_region %matmul tile_sizes [1, 16, 16, 0]
     ( mapping = [#gpu.block<x>, #gpu.block<y>, #gpu.block<z>] )
   //%forall, %tiled_matmul =
   //  transform.structured.tile_to_forall_op %matmul tile_sizes [1, 32, 32, 0]
@@ -58,27 +58,21 @@ transform.sequence failures(propagate) {
   //  : (!pdl.operation) -> (!pdl.operation, !pdl.operation)
   //%promoted_matmul_l2, %alloc_1, %alloc_2 = transform.iree.promote_operands %matmul_loopk [0, 2]
   //  : (!pdl.operation) -> (!pdl.operation, !pdl.operation, !pdl.operation)
-  //%promoted_matmul_l2, %alloc_1, %alloc_2 = transform.iree.promote_operands %matmul_loopk [0, 1]
-  //  : (!pdl.operation) -> (!pdl.operation, !pdl.operation, !pdl.operation)
-  %promoted_matmul_l2, %alloc_1 = transform.iree.promote_operands %matmul_loopk [0]
-    : (!pdl.operation) -> (!pdl.operation, !pdl.operation)
+  %promoted_matmul_l2, %alloc_1, %alloc_2 = transform.iree.promote_operands %matmul_loopk [0, 1]
+    : (!pdl.operation) -> (!pdl.operation, !pdl.operation, !pdl.operation)
+  //%promoted_matmul_l2, %alloc_1 = transform.iree.promote_operands %matmul_loopk [0]
+  //  : (!pdl.operation) -> (!pdl.operation, !pdl.operation)
   transform.iree.apply_patterns %variant_op {canonicalization, cse}
 
   // Step 5. Map to threads
   // ==============================================================
   //%forall_l3, %matmul_l3 =
-  //transform.structured.tile_to_forall_op %promoted_matmul_l2 num_threads [0, 1, 8]
+  //transform.structured.tile_to_forall_op %promoted_matmul_l2 num_threads [0, 8, 2]
   //  ( mapping = [#gpu.thread<y>, #gpu.thread<x>] )
-  transform.structured.tile_to_forall_op %im2col_loopk num_threads [0, 0, 64]
-    ( mapping = [#gpu.thread<x>] )
+  //transform.structured.tile_to_forall_op %im2col_loopk num_threads [0, 8, 1]
+  //  ( mapping = [#gpu.thread<y>, #gpu.thread<x>] )
   //%im2col_l3 = transform.structured.fuse_into_containing_op %promoted_img2col_l2 into %forall_l3
   transform.iree.apply_patterns %variant_op {canonicalization, cse}
-
-  // Contraction part mapped to threads with a **SIMD** programming model.
-  // =============================================================================
-  %forall_l3, %matmul_padded_l3 = 
-    transform.structured.tile_to_forall_op %promoted_matmul_l2 num_threads [0, 0, 2]
-      ( mapping = [#gpu.warp<x>])
 
   // Step 6. Vectorize
   // ==============================================================
@@ -102,7 +96,7 @@ transform.sequence failures(propagate) {
   %func_7 = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
   %func_8 = transform.iree.forall_to_workgroup %func_7
   %func_9 = transform.iree.map_nested_forall_to_gpu_threads %func_8
-      { workgroup_size = [64, 1, 1] }
+      { workgroup_size = [32, 1, 1] }
   transform.iree.apply_patterns %variant_op_3 {canonicalization, cse}
   %memref_func = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
   %hoisted_func = transform.iree.hoist_static_alloc %memref_func
@@ -111,6 +105,6 @@ transform.sequence failures(propagate) {
     : (!pdl.operation) -> !pdl.operation
   %func_11 = transform.iree.erase_hal_descriptor_type_from_memref %func_10
   transform.iree.apply_patterns %variant_op_3 {canonicalization, cse, licm, tiling_canonicalization}
-  %func_12 = transform.iree.vector.vector_to_mma_conversion %func_11 { use_wmma }
-  transform.iree.apply_patterns %variant_op_3 {canonicalization, cse, licm, tiling_canonicalization}
+  //%func_12 = transform.iree.vector.vector_to_mma_conversion %func_11 { use_wmma }
+  //transform.iree.apply_patterns %variant_op_3 {canonicalization, cse, licm, tiling_canonicalization}
 }
